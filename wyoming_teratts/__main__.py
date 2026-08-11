@@ -1,20 +1,20 @@
-import os
+"""Wyoming server entry point for TeraTTSv2 ONNX Engine."""
+
 import argparse
 from argparse import ArgumentParser
 import asyncio
 import contextlib
 import logging
+import re
 import sys
 from functools import partial
-from typing import Optional
+from typing import Any, Optional
 
 from wyoming.info import Attribution, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncServer
 
 from .handler import SpeechEventHandler
 from .speech_tts import SpeechTTS
-
-log = logging.getLogger(__name__)
 
 DEFAULT_SPEAKER_NAME = "ru_f1"
 MODEL_LANGUAGE = "ru-RU"
@@ -26,116 +26,178 @@ PROGRAM_DESCRIPTION = "Wyoming server for TeraTTSv2 ONNX Text-to-Speech"
 PROGRAM_VERSION = "2.0"
 
 
+class TeraTTSColorFormatter(logging.Formatter):
+    """Custom ANSI color formatter in Piper style."""
+
+    GRAY = "\033[90m"          # Серый цвет для всех обычных логов
+    UBUNTU_GREEN = "\033[38;2;38;162;105m"
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        asctime = self.formatTime(record, "%H:%M:%S")
+        record_msg = record.getMessage()
+
+        # Если это итоговая строка синтеза [Final] — выводим всю строку зеленым
+        if "[DONE]" in record_msg:
+            return f"{self.UBUNTU_GREEN}{asctime} [{record.levelname}] {record.name}: {record_msg}{self.RESET}"
+
+        # Все остальные логи выводим серым цветом
+        return f"{self.GRAY}{asctime} [{record.levelname}] {record.name}: {record_msg}{self.RESET}"
+
+
+log = logging.getLogger(__name__)
+
+
 def parse_target_db(val: Optional[str]) -> Optional[float]:
-    """Парсит аргумент командной строки --target-db."""
+    """Parse --target-db command line argument."""
     if val is None or str(val).lower() in ("none", "off", "false", "0", "disable"):
         return None
     try:
         return float(val)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"Invalid --target-db value: '{val}'. Expected float (e.g. -3.0) or 'off'."
+            f"Invalid --target-db value: '{val}'. Expected float (e.g., -3.0) or 'off'."
         )
+
+
+def load_silero_accentor() -> Optional[Any]:
+    """Attempt to load Silero Stress accentor model."""
+    try:
+        from silero_stress import load_accentor
+        accentor = load_accentor()
+        log.info("Silero Stress model loaded via 'silero-stress' package.")
+        return accentor
+    except ImportError:
+        pass
+
+    try:
+        import torch
+        torch.set_num_threads(1)
+        accentor = torch.hub.load(
+            repo_or_dir="snakers4/silero-stress",
+            model="silero_stress",
+            trust_repo=True,
+        )
+        log.info("Silero Stress model loaded via torch.hub.")
+        return accentor
+    except Exception as e:
+        log.warning("Failed to load Silero Stress accentor: %s", e)
+        return None
 
 
 async def main() -> None:
     parser = ArgumentParser(description="TeraTTSv2 Wyoming Server")
-    
+
     parser.add_argument(
-        "--uri", 
-        default="tcp://0.0.0.0:10201", 
-        help="URI сервера (по умолчанию: tcp://0.0.0.0:12001)"
+        "--uri",
+        default="tcp://0.0.0.0:10201",
+        help="Server URI (default: tcp://0.0.0.0:10201)",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Включить подробный логгинг (DEBUG).",
+        help="Enable detailed debug logging.",
     )
     parser.add_argument("--samples-per-chunk", type=int, default=1024)
 
-    # Параметры движка TeraTTSv2
+    # Silero Accentor Flag
+    parser.add_argument(
+        "--silero",
+        action="store_true",
+        help="Enable Silero Stress neural accentor for homograph correction.",
+    )
+
+    # TeraTTS Engine Options
     parser.add_argument(
         "--default-speaker",
         type=str,
         default=DEFAULT_SPEAKER_NAME,
-        help=f"Голос по умолчанию. Выбор из: {SpeechTTS.AVAILABLE_VOICES}"
+        help=f"Default voice speaker (default: {DEFAULT_SPEAKER_NAME}).",
     )
     parser.add_argument(
         "--duration-scale",
         type=float,
         default=1.0,
-        help="Коэффициент длительности (>1.0 медленнее, <1.0 быстрее)."
+        help="Duration scale factor (>1.0 slower, <1.0 faster).",
     )
     parser.add_argument(
         "--chunk-frames",
         type=int,
         default=16,
-        help="Размер потокового чанка вокодера (меньше = ниже задержка)."
+        help="Vocoder streaming chunk frames (smaller = lower latency).",
     )
     parser.add_argument(
         "--threads",
         type=int,
         default=None,
-        help="Число потоков CPU (по умолчанию авто: половина логических ядер)."
+        help="CPU thread count (default: auto).",
     )
     parser.add_argument(
         "--ruaccent-mode",
         type=str,
         default="dictionary",
         choices=["dictionary", "full"],
-        help="Режим ударений: 'dictionary' (быстрый) или 'full' (нейросеть)."
+        help="RuAccent mode: 'dictionary' (fast) or 'full' (neural).",
     )
     parser.add_argument(
         "--diffusion-model",
         type=str,
         default="distilled",
         choices=["distilled", "teacher"],
-        help="Модель сэмплера: 'distilled' (быстрый) или 'teacher'."
+        help="Diffusion model sampler: 'distilled' (fast) or 'teacher'.",
     )
     parser.add_argument(
         "--target-db",
         type=parse_target_db,
         default=None,
-        help="Целевой уровень громкости в dBFS (например, -3.0). По умолчанию выключен ('off').",
+        help="Target volume level  (e.g. -6.0). Default: off.",
     )
 
-    # Задержки тишины (Piper-style)
+    # Silence Delays
     parser.add_argument(
         "--silence-before",
         type=float,
         default=0.05,
-        help="Задержка тишины перед началом речи (сек)."
+        help="Silence padding before speech start (seconds).",
     )
     parser.add_argument(
         "--silence-sentence",
         type=float,
-        default=0.25,
-        help="Пауза тишины между предложениями (сек)."
+        default=0.20,
+        help="Silence delay between sentences (seconds).",
     )
     parser.add_argument(
         "--silence-paragraph",
         type=float,
         default=0.60,
-        help="Пауза тишины между абзацами и диалогами (сек)."
+        help="Silence delay between paragraphs and dialogues (seconds).",
     )
 
-    # Потоковый режим
+    # Streaming Options
     parser.add_argument(
         "--no-streaming",
         action="store_false",
         dest="streaming",
-        help="Отключить стриминг по предложениям.",
+        help="Disable sentence streaming mode.",
     )
     parser.set_defaults(streaming=True)
 
     args = parser.parse_args()
 
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    # Configure logging with custom ANSI colors
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(TeraTTSColorFormatter())
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    root_logger.addHandler(handler)
 
     log.info("Starting TeraTTSv2 Wyoming Server...")
+
+    accentor = None
+    if args.silero:
+        log.info("Initializing Silero Stress Accentor...")
+        accentor = load_silero_accentor()
 
     try:
         speech_tts_instance = SpeechTTS(
@@ -143,31 +205,40 @@ async def main() -> None:
             ruaccent_mode=args.ruaccent_mode,
             diffusion_model=args.diffusion_model,
             chunk_frames=args.chunk_frames,
-            target_db=args.target_db
+            target_db=args.target_db,
         )
     except Exception as e:
-        log.critical(f"Failed to initialize TeraTTSv2 engine: {e}")
+        log.critical("Failed to initialize TeraTTSv2 engine: %s", e)
         sys.exit(1)
 
-    if args.default_speaker not in SpeechTTS.AVAILABLE_VOICES:
-        log.warning(
-            f"Default speaker '{args.default_speaker}' not in {SpeechTTS.AVAILABLE_VOICES}. "
-            f"Falling back to '{DEFAULT_SPEAKER_NAME}'."
+    available_voices = speech_tts_instance.voices
+
+    if args.default_speaker not in available_voices:
+        fallback_speaker = getattr(
+            speech_tts_instance.model.config, "default_voice", DEFAULT_SPEAKER_NAME
         )
-        args.default_speaker = DEFAULT_SPEAKER_NAME
+        log.warning(
+            "Default speaker '%s' not in %s. Falling back to '%s'.",
+            args.default_speaker,
+            available_voices,
+            fallback_speaker,
+        )
+        args.default_speaker = fallback_speaker
 
     voices = []
-    voice_map = {name: name for name in SpeechTTS.AVAILABLE_VOICES}
+    voice_map = {name: name for name in available_voices}
 
-    for name in SpeechTTS.AVAILABLE_VOICES:
-        voices.append(TtsVoice(
-            name=name,
-            description=f"TeraTTS Voice {name}",
-            attribution=Attribution(name=ATTRIBUTION_NAME, url=ATTRIBUTION_URL),
-            installed=True,
-            version=DEFAULT_VOICE_VERSION,
-            languages=[MODEL_LANGUAGE]
-        ))
+    for name in available_voices:
+        voices.append(
+            TtsVoice(
+                name=name,
+                description=name,  # Убрали "TeraTTS Voice ", теперь в названии только имя (напр. ru_f1)
+                attribution=Attribution(name=ATTRIBUTION_NAME, url=ATTRIBUTION_URL),
+                installed=True,
+                version=DEFAULT_VOICE_VERSION,
+                languages=[MODEL_LANGUAGE],
+            )
+        )
 
     wyoming_info = Info(
         tts=[
@@ -176,7 +247,7 @@ async def main() -> None:
                 description=PROGRAM_DESCRIPTION,
                 attribution=Attribution(
                     name=ATTRIBUTION_NAME,
-                    url=ATTRIBUTION_URL
+                    url=ATTRIBUTION_URL,
                 ),
                 installed=True,
                 version=PROGRAM_VERSION,
@@ -193,10 +264,11 @@ async def main() -> None:
         speech_tts_instance,
         voice_map,
         args.default_speaker,
+        accentor,
     )
 
     server = AsyncServer.from_uri(args.uri)
-    log.info(f"Server is listening at {args.uri}")
+    log.info("Server is listening at %s", args.uri)
     await server.run(handler_factory)
 
 
